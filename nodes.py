@@ -443,6 +443,9 @@ class ReduxAdvanced:
          3. 如果 mode 为 "autocrop with mask"，则先计算图像的宽高比，然后根据 desiredSize 裁剪出正方形图像。
         """
         image, masko = prepareImageAndMask(clip_vision, image, mask, mode, autocrop_margin)
+        """
+        image 经过处理变成 torch.Size([1, 384, 384, 3])
+        """
         
         # 用 CLIP 对图像进行编码，得到图像特征；将掩膜进一步 patchify
         """
@@ -450,6 +453,9 @@ class ReduxAdvanced:
         掩膜的分块处理（patchify）是为了与特征向量的 token 对应起来，便于在下游任务中应用掩膜
         """
         clip_vision_output, mask = (clip_vision.encode_image(image), patchifyMask(masko))
+        """
+        clip_vision.encode_image(image) 通过siglip模型将像素图像编码成视觉token，张量为: torch.Size([1, 729, 1152])
+        """
         
         # 这里将 style_model.get_cond(clip_vision_output) 得到的视觉向量视为 cond
         # shape 通常为 (batch, token, hidden_dim)
@@ -485,6 +491,9 @@ class ReduxAdvanced:
         这么做的目的是为了将cond视为一个整体，便于后续的mask操作
         """
         cond = style_model.get_cond(clip_vision_output).flatten(start_dim=0, end_dim=1).unsqueeze(dim=0)
+        """
+        cond 张量维度是torch.Size([1, 729, 4096]),其中4096是文本编码器的维度，而729则是siglip模型的将图像分成27*27=729个小块
+        """
         (b,t,h) = cond.shape
 
         # 这里的m是为了将cond的shape变为(1, m, m, hidden_dim)
