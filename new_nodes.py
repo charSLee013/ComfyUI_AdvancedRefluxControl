@@ -730,16 +730,84 @@ def generate_slices_v2(image_tensor, base_size=384, interpolation_mode="bicubic"
     
     return slices
 
+class ReduxAdvancedPaligemma:
+    """
+    此节点采用 paligemma2-3b-pt-896 模型来编码图像，从而在保留细节的同时维持整体结构。
+    
+    输入参数说明：
+        conditioning: 文本编码器生成的 conditioning，格式为列表，每个元素为 [tensor, options_dict]
+        style_model: 风格模型，需包含 get_cond 方法，将 clip_vision 的输出转换为视觉特征向量。
+        clip_vision: CLIP 或兼容的视觉编码器，负责将图像转换为视觉特征。
+        image: 输入图像，格式为 torch.Tensor，其形状为 (B, H, W, C)。
+        resize: 整数，支持的取值为 224, 384, 448, 896，用于在将图像传入 clip_vision 前对图像进行缩放，
+                缩放目标为正方形尺寸 (resize, resize)。
+                
+    返回：
+        (CONDITIONING, IMAGE)：
+            CONDITIONING - 将文本条件与视觉特征融合后的结果，格式和各下游模块兼容；
+            IMAGE - 缩放后的图像，用于后续处理或展示。
+    """
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "conditioning": ("CONDITIONING", ),
+                "style_model": ("STYLE_MODEL", ),
+                "clip_vision": ("CLIP_VISION", ),
+                "image": ("IMAGE", ),
+                "resize": ("INT", {"default": 384, "options": [224, 384, 448, 896]})
+            }
+        }
+    
+    RETURN_TYPES = ("CONDITIONING", "IMAGE")
+    FUNCTION = "apply_stylemodel"
+    CATEGORY = "conditioning/style_model"
+
+    def apply_stylemodel(self, clip_vision, image, style_model, conditioning, resize):
+        """
+        根据指定的 resize 参数调整输入 image 的尺寸，再利用新的 paligemma2-3b-pt-896 模型进行视觉编码，
+        最后将得到的视觉 tokens 与文本条件进行拼接，返回融合后的 conditioning 以及处理后的 image。
+        """
+        import torch.nn.functional as F
+
+        # 假设输入 image 形状为 (B, H, W, C)，先转换为 (B, C, H, W) 方便插值
+        image_t = image.permute(0, 3, 1, 2)
+        # 按照 resize 指定的尺寸重缩放得到目标大小的图像
+        image_resized = F.interpolate(image_t, size=(resize, resize), mode="bicubic", align_corners=False)
+        # 转换回 (B, H, W, C)
+        image_resized = image_resized.permute(0, 2, 3, 1)
+        
+        # 使用 clip_vision 对缩放后的图像进行编码
+        clip_vision_output = clip_vision.encode_image(image_resized)
+        # 利用 style_model 提取视觉特征（视觉 tokens），格式一般为 (B, tokens, hidden_dim)
+        cond = style_model.get_cond(clip_vision_output)
+        
+        # 将视觉 token flatten 成合适的形状，形式转换为 (1, batch*tokens, hidden_dim)
+        cond = cond.flatten(start_dim=0, end_dim=1).unsqueeze(dim=0)
+        
+        # 将视觉 tokens 拼接回原先的文本 conditioning 中，构成综合的提示信息
+        c = []
+        for t in conditioning:
+            # 假设 t[0] 是文本 token，t[1] 是附加信息（例如 pooled_output 或 guidance）
+            new_cond = torch.cat((t[0], cond), dim=1)
+            c.append([new_cond, t[1].copy()])
+        
+        # 返回融合后的 conditioning 和缩放后的图像
+        return (c, image_resized)
+
 
 # 以下字典用于将节点类映射到对应的全局名称，以及在 ComfyUI 中的节点显示名
 NEW_NODE_CLASS_MAPPINGS = {
     "NewStyleModelApplySimple": StyleModelApplySimple,
-    "NewReduxAdvanced": ReduxAdvanced
+    "NewReduxAdvanced": ReduxAdvanced,
+    "NewReduxAdvancedPaligemma": ReduxAdvancedPaligemma  # 新增的节点类映射
 }
 
 NEW_NODE_DISPLAY_NAME_MAPPINGS = {
     "New StyleModelApplySimple": "New Apply style model (simple)",
-    "New ReduxAdvanced": "New Apply Redux model (advanced)"
+    "New ReduxAdvanced": "New Apply Redux model (advanced)",
+    "New ReduxAdvancedPaligemma": "New Apply Redux model (paligemma)"  # 新增的节点显示名
 }
 
 if __name__ == '__main__':
