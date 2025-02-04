@@ -54,6 +54,57 @@ def automerge(tensor, threshold):
         newTensor.append(torch.stack(tokens))
     return torch.stack(newTensor)
 
+def automerge_v2(tensor, threshold):
+    """
+    改进版：在合并时保留位置权重，并采用累积权重的加权平均与归一化处理
+
+    Args:
+        tensor (torch.FloatTensor): 形状为 (batch, seq, dim)
+        threshold (float): 合并 token 的余弦相似度阈值
+
+    Returns:
+        torch.FloatTensor: 合并后的 token 序列，形状为 (batch, N, dim)，其中每个 batch 内
+                           的 N 可能不一致（按实际合并结果）。
+    """
+    batch, seq, dim = tensor.shape
+    # 生成位置权重：线性从 1.0 衰减到 0.8（可根据需要调整）
+    position_weights = torch.linspace(1.0, 0.8, steps=seq, device=tensor.device, dtype=tensor.dtype)
+    
+    merged_tokens = []
+    for b in range(batch):
+        tokens = []
+        # 对于当前 batch，使用累积权重实现加权平均
+        # 初始化第一个 token
+        weighted_sum = tensor[b, 0] * position_weights[0]
+        cumulative_weight = position_weights[0]
+        merged_token = weighted_sum / cumulative_weight  # 初始合并 token
+
+        for i in range(1, seq):
+            current_weight = position_weights[i]
+            current_weighted = tensor[b, i] * current_weight
+
+            # 对当前合并 token 和当前 token 分别进行归一化，以便计算余弦相似度
+            merged_norm = merged_token / (merged_token.norm(p=2) + 1e-8)
+            current_norm = current_weighted / (current_weighted.norm(p=2) + 1e-8)
+            cosine = torch.dot(merged_norm, current_norm)
+            
+            if cosine >= threshold:
+                # 如果相似，更新累积权重和加权和
+                weighted_sum = weighted_sum + current_weighted
+                cumulative_weight += current_weight
+                merged_token = weighted_sum / cumulative_weight
+            else:
+                # 如果当前 token与合并token相似度不够，则保存当前合并token，并重置累积信息
+                tokens.append(merged_token)
+                weighted_sum = current_weighted
+                cumulative_weight = current_weight
+                merged_token = weighted_sum / cumulative_weight
+        # 别忘了将当前 batch 的最后一个合并 token 添加进来
+        tokens.append(merged_token)
+        merged_tokens.append(torch.stack(tokens))
+    
+    return torch.stack(merged_tokens)
+
 # 这里定义了几个强度等级与对应的数值，主要用于简单的图像风格混合节点
 STRENGTHS = ["highest", "high", "medium", "low", "lowest"]
 STRENGTHS_VALUES = [1, 2, 3, 4, 5]
@@ -405,7 +456,10 @@ class ReduxAdvanced:
                              "downsampling_factor": ("INT", {"default": 3, "min": 1, "max":9}),
                              "downsampling_function": (["nearest", "bilinear", "bicubic","area","nearest-exact"], {"default": "area"}),
                              "mode": (IMAGE_MODES, {"default": "center crop (square)"}),
-                             "weight": ("FLOAT", {"default": 1.0, "min":0.0, "max":1.0, "step":0.01})
+                             "weight": ("FLOAT", {"default": 1.0, "min":0.0, "max":1.0, "step":0.01}),
+                             "slice_version": (["v1", "v2"], {"default": "v2"}),
+                             "interpolation_mode": (["nearest", "bilinear", "bicubic"], {"default": "bicubic"}),
+                             "merge_threshold": ("FLOAT", {"default": 0.95, "min": 0.1, "max": 1.0, "step": 0.01})
                             },
                 "optional": {
                             "mask": ("MASK", ),
@@ -418,7 +472,7 @@ class ReduxAdvanced:
 
     def apply_stylemodel(self, clip_vision, image, style_model, conditioning,
                          downsampling_factor, downsampling_function, mode, weight,
-                         mask=None, autocrop_margin=0.0):
+                         mask=None, autocrop_margin=0.0, slice_version="v2", interpolation_mode="bicubic", merge_threshold=0.95):
         """
         将输入图像先用 CLIP Vision 编码出特征，再由 style_model 将该特征转换为可融合至文本条件中的向量。
         可以通过多种下采样方式、掩膜等手段精细控制这些向量的生成与合并。
@@ -434,6 +488,9 @@ class ReduxAdvanced:
             weight (float): 融合权重，越大则该图像特征在最终生成中的影响力越大。
             mask (torch.FloatTensor or None): 掩膜，用于指定关注的图像区域。
             autocrop_margin (float): 在 "autocrop with mask" 时，给前景区域额外留出的边距。
+            slice_version (str): 选择切片版本，"v1" 或 "v2"。
+            interpolation_mode (str): 插值算法，"nearest"、"bilinear" 或 "bicubic"。
+            merge_threshold (float): 视觉 token 合并的相似性阈值，取值范围为 [0.5, 1.0]。
         
         Returns:
             (list, torch.FloatTensor, torch.FloatTensor or None): 
@@ -501,7 +558,13 @@ class ReduxAdvanced:
         """
         # 修改后的 multi-slice 处理逻辑
         if mode == "multi-slice":
-            slices = generate_slices(image, base_size=384, overlap_ratio=0.1)
+            if slice_version == "v1":
+                slices = generate_slices(image, base_size=384, overlap_ratio=0.1)
+            else:  # v2版本
+                slices = generate_slices_v2(image, 
+                    base_size=384,
+                    interpolation_mode=interpolation_mode)
+            
             cond_slices = []
             
             # 处理每个切片
@@ -555,6 +618,13 @@ class ReduxAdvanced:
         # 不直接使用线性权重（cond * weight），而是使用平方权重（cond * weight * weight），
         # 这样可以确保权重在最终条件中的影响力度是线性的，而不是平方的。
         cond = cond * (weight * weight)
+        
+        # 利用 merge_threshold 对相似的视觉 token 进行自动合并
+        # 当 merge_threshold 小于 1.0 时执行合并，否则保留所有 token
+        if merge_threshold < 1.0:
+            print(f"[DEBUG] Pre-merge cond shape: {cond.shape}") 
+            cond = automerge_v2(cond, merge_threshold)
+            print(f"[DEBUG] Post-merge cond shape: {cond.shape}")
         
         # 如果存在 mask，我们会先用 mask 筛选 cond，再填充到相同长度
         if mask is not None:
@@ -615,6 +685,52 @@ def generate_slices(image_tensor, base_size=384, overlap_ratio=0.1):
     
     return slices
 
+
+def generate_slices_v2(image_tensor, base_size=384, interpolation_mode="bicubic"):
+    """
+    改进版切片函数，先对齐分辨率再切片
+    
+    Args:
+        image_tensor: (B, H, W, C) 格式的输入图像
+        base_size: 切片基准尺寸
+        interpolation_mode: 插值算法
+    
+    Returns:
+        slices: 切片列表 [(slice_tensor, (x1, y1, x2, y2)), ...]
+    """
+    B, H, W, C = image_tensor.shape
+    
+    # 分辨率对齐
+    def align_resolution(size):
+        return max(base_size, (size // base_size) * base_size)
+    
+    aligned_H = align_resolution(H)
+    aligned_W = align_resolution(W)
+    
+    # 使用指定插值算法缩放
+    if aligned_H != H or aligned_W != W:
+        image_tensor = torch.nn.functional.interpolate(
+            image_tensor.permute(0, 3, 1, 2),
+            size=(aligned_H, aligned_W),
+            mode=interpolation_mode,
+            antialias=True
+        ).permute(0, 2, 3, 1)
+    
+    # 生成规则切片
+    slices = []
+    num_rows = aligned_H // base_size
+    num_cols = aligned_W // base_size
+    
+    for row in range(num_rows):
+        for col in range(num_cols):
+            y = row * base_size
+            x = col * base_size
+            slice_tensor = image_tensor[:, y:y+base_size, x:x+base_size, :]
+            slices.append((slice_tensor, (x, y, x+base_size, y+base_size)))
+    
+    return slices
+
+
 # 以下字典用于将节点类映射到对应的全局名称，以及在 ComfyUI 中的节点显示名
 NEW_NODE_CLASS_MAPPINGS = {
     "NewStyleModelApplySimple": StyleModelApplySimple,
@@ -640,7 +756,8 @@ if __name__ == '__main__':
         image_tensor = torch.rand((1, size, size, 3))  # 生成随机RGB图像
 
         # 调用 generate_slices 函数
-        slices = generate_slices(image_tensor, base_size=base_size, overlap_ratio=overlap_ratio)
+        # slices = generate_slices(image_tensor, base_size=base_size, overlap_ratio=overlap_ratio)
+        slices = generate_slices_v2(image_tensor, base_size=384)
 
         # 输出切片信息
         print(f"Image size: {size}x{size}")
