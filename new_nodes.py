@@ -681,7 +681,7 @@ def generate_slices(image_tensor, base_size=384, overlap_ratio=0.1):
                 x = max(0, x_end - base_size)
                 
             slice_tensor = image_tensor[:, y:y_end, x:x_end, :]
-            slices.append( (slice_tensor, (x, y, x_end, y_end)) )
+            slices.append((slice_tensor, (x, y, x_end, y_end)))
     
     return slices
 
@@ -797,18 +797,166 @@ class ReduxAdvancedPaligemma:
         return (c, image_resized)
 
 
+class DuplicateConditioning:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "conditioning": ("CONDITIONING",),
+                "copy_factor": ("INT", {"default": 0, "min": 0, "max": 20}),
+                "mode": (["空白模式", "本体模式"], {"default": "本体模式"})
+            }
+        }
+    
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "duplicate_conditioning"
+    CATEGORY = "conditioning/utils"
+
+    def duplicate_conditioning(self, conditioning, copy_factor, mode):
+        """
+        节点功能：
+          - 根据输入的模式生成新的 conditioning token：
+              * "空白模式"：创建与原 conditioning 同形状但数值全部为 0 的张量；
+              * "本体模式"：直接复制原 conditioning 张量。
+          - 如果 copy_factor 为 0 则不做任何处理，直接返回原始 conditioning；
+          - 否则，将得到的新 token 根据复制因子 copy_factor 复制多份，
+            然后沿 token 的维度（dim=1）拼接在原 conditioning 后面，
+            并存储到新的 conditioning 列表中。
+        
+        Args:
+            conditioning: 原始的 conditioning 列表，每个元素形如 [tensor, options]。
+            copy_factor (int): 复制因子，指定复制多少份（最小为 0）。
+            mode (str): 模式选择，"空白模式"或"本体模式"。
+        
+        Returns:
+            list: 更新后的 conditioning 列表。
+        """
+        import torch
+
+        if copy_factor == 0:
+            # 如果复制因子为 0，则直接返回原始 conditioning
+            return (conditioning,)
+        
+        new_conditioning = []
+        for cond in conditioning:
+            # cond 结构为 [tensor, options_dict]
+            original_tensor = cond[0]
+            options = cond[1].copy()
+
+            if mode == "空白模式":
+                # 创建与原张量同形状但全部为 0 的新 token
+                new_token = torch.zeros_like(original_tensor)
+            else:  # mode 为 "本体模式"
+                new_token = original_tensor.clone()
+
+            # 根据复制因子复制 copy_factor 份新 token，并沿 token 维度拼接在原 tensor 后面
+            replicated = new_token.repeat(1, copy_factor, 1)
+            merged_tensor = torch.cat([original_tensor, replicated], dim=1)
+            new_conditioning.append([merged_tensor, options])
+        
+        return (new_conditioning,)
+
+class PaligemmaApplyStyleModel:
+    """
+    使用 paligemma2 模型提取图像视觉特征，并将其融合到文本条件（conditioning）中。
+
+    输入参数：
+        - conditioning: 文本条件列表，每个元素格式为 [tensor, options_dict]
+        - style_model: 包含 get_cond 方法的对象，用于将视觉特征转换为条件向量
+        - image: 输入图像，支持（图片路径、PIL 图像、numpy 数组或 torch 张量）多种格式
+        - model_dir: 字符串，指定视觉模型所在路径或模型标识符，默认值为 "mirror013/paligemma2-vision-model-896"
+                     如果 model_dir 是有效的文件夹路径，则直接加载模型；否则调用 snapshot_download 进行下载
+
+    处理流程：
+        1. 根据 model_dir 判断是否已经有模型文件夹，如果无则下载至本地
+        2. 加载 SiglipImageProcessor 和 SiglipVisionModel，并设置为 evaluation 模式
+        3. 根据传入的图像类型转换为 PIL.Image 格式
+        4. 利用处理器对图像进行预处理，并前向计算得到视觉特征
+        5. 利用 style_model.get_cond 将视觉特征转换为条件向量，flatten 后与原有文本条件拼接
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "conditioning": ("CONDITIONING",),
+                "style_model": ("STYLE_MODEL",),
+                "image": ("IMAGE",),
+                "model_dir": ("STRING", {"default": "mirror013/paligemma2-vision-model-896"})
+            }
+        }
+    
+    RETURN_TYPES = ("CONDITIONING", "IMAGE")
+    FUNCTION = "apply_stylemodel"
+    CATEGORY = "conditioning/style_model"
+
+    def apply_stylemodel(self, conditioning, style_model, image, model_dir):
+        import os
+        import torch
+        from transformers import SiglipVisionModel, SiglipImageProcessor
+        from modelscope import snapshot_download
+
+        # 判断 model_dir 是否为有效的文件夹路径
+        if os.path.isdir(model_dir):
+            vision_model_path = model_dir
+        else:
+            vision_model_path = snapshot_download(model_dir)
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            # 加载图像处理器和视觉模型
+            processor = SiglipImageProcessor.from_pretrained(vision_model_path)
+            vision_model = SiglipVisionModel.from_pretrained(vision_model_path).to(device)
+            vision_model.eval()
+
+            # 图像预处理：图像乘以255转换为uint8类型
+            image_uint8 = (image * 255).round().clamp(0, 255).to(torch.uint8)
+            # 处理器对图像预处理，返回 inputs 对象，其中 inputs.pixel_values 的范围为 [-1,1]，形状为 (B, C, H, W)
+            inputs = processor(images=image_uint8, return_tensors="pt").to(device)
+            # 前向计算获取视觉特征
+            with torch.inference_mode():
+                outputs = vision_model(inputs.pixel_values)
+        finally:
+            if "vision_model" in locals():
+                del vision_model
+            torch.cuda.empty_cache()
+
+        # 使用 style_model.get_cond 将视觉特征转换为条件向量
+        cond = style_model.get_cond(outputs)
+        # 将条件向量 flatten 成形状 (1, batch * tokens, hidden_dim)
+        cond = cond.flatten(start_dim=0, end_dim=1).unsqueeze(dim=0)
+
+        new_conditioning = []
+        for t in conditioning:
+            merged = torch.cat((t[0], cond), dim=1)
+            new_conditioning.append([merged, t[1].copy()])
+
+        # 将 inputs.pixel_values 转换回正常的图像：
+        # 1. 从 [-1, 1] 转换到 [0, 1]
+        # 2. 调整维度为 (B, H, W, C)
+        # 3. 确保设备与原始 image 相同
+        pixel_values = (inputs.pixel_values + 1.0) / 2.0
+        pixel_values = pixel_values.permute(0, 2, 3, 1).to(image.device)
+
+        return (new_conditioning, pixel_values)
+
+
 # 以下字典用于将节点类映射到对应的全局名称，以及在 ComfyUI 中的节点显示名
 NEW_NODE_CLASS_MAPPINGS = {
     "NewStyleModelApplySimple": StyleModelApplySimple,
     "NewReduxAdvanced": ReduxAdvanced,
-    "NewReduxAdvancedPaligemma": ReduxAdvancedPaligemma  # 新增的节点类映射
+    "NewReduxAdvancedPaligemma": ReduxAdvancedPaligemma,  # 新增的节点类映射
+    "DuplicateConditioning": DuplicateConditioning,  # 新增的节点类映射
+    "PaligemmaApplyStyleModel": PaligemmaApplyStyleModel  # 新增的节点类映射
 }
 
 NEW_NODE_DISPLAY_NAME_MAPPINGS = {
     "New StyleModelApplySimple": "New Apply style model (simple)",
     "New ReduxAdvanced": "New Apply Redux model (advanced)",
-    "New ReduxAdvancedPaligemma": "New Apply Redux model (paligemma)"  # 新增的节点显示名
+    "New ReduxAdvancedPaligemma": "New Apply Redux model (paligemma)",  # 新增的节点显示名
+    "Duplicate Conditioning": "Duplicate Conditioning Node",  # 新增的节点显示名
+    "Paligemma Apply Style Model": "Paligemma Apply Style Model Node"  # 新增的节点显示名
 }
+
 
 if __name__ == '__main__':
     # 测试 generate_slices 函数的可行性
